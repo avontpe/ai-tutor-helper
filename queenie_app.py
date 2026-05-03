@@ -1,0 +1,1619 @@
+"""
+AI Tutor Helper v3.6
+================================
+跨裝置雲端網頁 App（iPad / 桌機 / 手機皆可用）
+
+v3.6 重大更新：
+- 🔐 雙層密碼保護（學生 + 家長後台）
+- 💰 統一 NT$ 顯示 + 自然月計費
+- 📚 數學雙軌制（學校 B + 學測 A）
+- 📋 章節下拉選單（取代手動輸入）
+- 🏆 達標獎勵系統（家長後台彈性開關）
+- 📊 月度家庭報告
+- 🎨 UI 大幅優化
+- ⚡ Gemini 2.0 Flash（修復 1.5-pro 已停用問題）
+"""
+
+import streamlit as st
+import sqlite3
+import json
+import random
+import base64
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from contextlib import contextmanager
+
+# ============================================================
+# 0. 個人化設定（從 Secrets 讀取）
+# ============================================================
+
+def get_user_config():
+    return {
+        "STUDENT_NAME": st.secrets.get("STUDENT_NAME", "同學"),
+        "SCHOOL_NAME": st.secrets.get("SCHOOL_NAME", ""),
+        "EXAM_YEAR": st.secrets.get("EXAM_YEAR", "116"),
+        "EXAM_DATE_STR": st.secrets.get("EXAM_DATE", "2027-01-22"),
+        "DEFAULT_GRADE": st.secrets.get("DEFAULT_GRADE", "高二"),
+        "TEXTBOOK_JSON": st.secrets.get("TEXTBOOK_JSON", ""),
+        "APP_PASSWORD": st.secrets.get("APP_PASSWORD", ""),
+        "PARENT_PASSWORD": st.secrets.get("PARENT_PASSWORD", ""),
+    }
+
+USER = get_user_config()
+STUDENT_NAME = USER["STUDENT_NAME"]
+SCHOOL_NAME = USER["SCHOOL_NAME"]
+EXAM_YEAR = USER["EXAM_YEAR"]
+APP_PASSWORD = USER["APP_PASSWORD"]
+PARENT_PASSWORD = USER["PARENT_PASSWORD"]
+NICKNAME = f"Hi {STUDENT_NAME[:1]}~"
+
+try:
+    EXAM_DATE = datetime.strptime(USER["EXAM_DATE_STR"], "%Y-%m-%d").date()
+except:
+    EXAM_DATE = date(2027, 1, 22)
+
+START_DATE = date(2026, 5, 2)
+USD_TO_TWD = 32  # 匯率
+
+# ============================================================
+# 1. 應用程式設定
+# ============================================================
+
+st.set_page_config(
+    page_title=f"{NICKNAME} 學測導航",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="auto",
+)
+
+# ---- 預設教科書版本 ----
+DEFAULT_TEXTBOOK = {
+    "國文": {"高二": "通用版", "高三": "通用版"},
+    "英文": {"高二": "通用版", "高三": "通用版"},
+    "數學B": {"高二": "通用版", "高三": "通用版"},
+    "數學A": {"高二": "通用版", "高三": "通用版"},
+    "物理": {"高二": "通用版", "高三": "通用版"},
+    "化學": {"高二": "通用版", "高三": "通用版"},
+    "生物": {"高二": "通用版", "高三": "通用版"},
+    "歷史": {"高二": "通用版", "高三": "通用版"},
+    "地理": {"高二": "通用版", "高三": "通用版"},
+    "公民": {"高二": "通用版", "高三": "通用版"},
+}
+
+try:
+    if USER["TEXTBOOK_JSON"]:
+        TEXTBOOK = json.loads(USER["TEXTBOOK_JSON"])
+        # 補上學測科目（若 Secrets 沒有）
+        for sub, default in DEFAULT_TEXTBOOK.items():
+            if sub not in TEXTBOOK:
+                TEXTBOOK[sub] = default
+    else:
+        TEXTBOOK = DEFAULT_TEXTBOOK
+except:
+    TEXTBOOK = DEFAULT_TEXTBOOK
+
+ALL_SUBJECTS = ["國文", "英文", "數學B", "數學A", "物理", "化學", "生物", "歷史", "地理", "公民"]
+EXAM_SUBJECTS = ["國文", "英文", "數學A", "物理", "化學", "生物", "歷史", "地理", "公民"]  # 學測重點
+
+# ---- 章節資料庫（學測九科 + 數學雙軌）----
+CHAPTERS = {
+    "國文": {
+        "高二": ["📌 第二次段考範圍", "L1 古文觀止選讀", "L2 現代散文選讀", "L3 現代詩選讀",
+                "L4 古典詩詞（唐詩宋詞）", "L5 文化經典（論語、孟子）", "L6 應用文與作文",
+                "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "L1 史傳文選讀", "L2 議論文選讀", "L3 哲思散文",
+                "L4 文化經典（莊子、史記）", "L5 文學批評與賞析", "L6 學測作文衝刺",
+                "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "英文": {
+        "高二": ["📌 第二次段考範圍", "Unit 1 — Reading & Vocabulary", "Unit 2 — Tenses",
+                "Unit 3 — Conditional Sentences", "Unit 4 — Passive Voice", "Unit 5 — Relative Clauses",
+                "Unit 6 — Cloze Test", "📝 短文寫作", "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "Unit 1 — 學測閱讀測驗", "Unit 2 — 進階句型",
+                "Unit 3 — 圖表題", "Unit 4 — 翻譯題", "Unit 5 — 看圖寫作", "Unit 6 — 學測模擬卷",
+                "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "數學B": {
+        "高二": ["📌 第二次段考範圍", "三角函數（基礎）", "三角恆等式", "直線與圓",
+                "平面向量", "機率（基礎）", "統計（基礎）", "數列與級數",
+                "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "矩陣（基礎）", "二次曲線", "機率（進階）",
+                "統計（信賴區間）", "🌐 學測 B 重點", "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "數學A": {
+        "高二": ["📌 學測常考重點", "三角函數（含進階公式）", "三角恆等式（深入）",
+                "直線與圓", "平面向量", "空間向量（A 限定）", "矩陣（含特徵值）",
+                "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 學測常考重點", "矩陣（進階）", "二次曲線", "機率（條件、貝氏）",
+                "統計（信賴區間、迴歸）", "微分（極限、導數）", "積分（基礎）",
+                "🌐 學測歷屆題型", "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "物理": {
+        "高二": ["📌 第二次段考範圍", "力學（牛頓三大定律）", "動量與衝量", "能量守恆",
+                "圓周運動與重力", "簡諧運動", "流體力學", "熱學",
+                "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "波動學", "聲學", "光學（幾何 + 波動）",
+                "電磁學（電場、磁場）", "電路與電磁感應", "近代物理（量子、原子）",
+                "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "化學": {
+        "高二": ["📌 第二次段考範圍", "物質的組成", "化學反應與計量（莫耳）",
+                "物質的狀態（氣液固溶液）", "化學反應的能量", "反應速率",
+                "化學平衡", "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "酸鹼鹽（pH、緩衝）", "氧化還原",
+                "電化學（電池、電解）", "有機化學（官能基）", "生物化學（糖脂蛋白）",
+                "化學在生活中的應用", "🌐 學測必考實驗", "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "生物": {
+        "高二": ["📌 第二次段考範圍", "細胞構造與功能", "遺傳（孟德爾）",
+                "分子遺傳（DNA、RNA）", "演化", "生物多樣性",
+                "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "動物的構造（消化、循環）", "神經與內分泌",
+                "免疫系統", "生殖與發育", "生態學", "生物科技",
+                "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "歷史": {
+        "高二": ["📌 第二次段考範圍", "史前時代與古文明", "中國古代史（先秦至唐）",
+                "中國近世史（宋元明清）", "中國近代史（晚清民國）", "台灣史（早期至日治）",
+                "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "世界古代史", "歐洲中世紀與文藝復興",
+                "大航海與啟蒙運動", "工業革命與兩次世界大戰", "戰後世界（冷戰至全球化）",
+                "當代議題", "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "地理": {
+        "高二": ["📌 第二次段考範圍", "地理技能（地圖、GIS）", "自然地理（地形氣候）",
+                "人文地理（人口、產業、都市）", "區域地理（亞洲）",
+                "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "區域地理（歐洲、非洲）", "區域地理（美洲、大洋洲）",
+                "全球議題（氣候、糧食）", "永續發展", "地理時事題（圖表判讀）",
+                "🌐 全範圍混合", "✏️ 自訂"],
+    },
+    "公民": {
+        "高二": ["📌 第二次段考範圍", "自我與社會", "民主政治（政府、選舉）",
+                "法律與生活（憲、刑、民）", "經濟學基礎（供需、市場）",
+                "🌐 全範圍混合", "✏️ 自訂"],
+        "高三": ["📌 第二次段考範圍", "國際關係", "全球化議題",
+                "經濟學進階（GDP、貨幣）", "永續發展與社會責任", "時事分析（學測考古）",
+                "🌐 全範圍混合", "✏️ 自訂"],
+    },
+}
+
+
+def get_chapters(subject, grade):
+    try:
+        return CHAPTERS[subject][grade]
+    except KeyError:
+        return ["📌 預設範圍", "🌐 全範圍混合", "✏️ 自訂"]
+
+
+DB_PATH = Path("study_data.db")
+
+
+# ============================================================
+# 2. CSS（精緻化）
+# ============================================================
+
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Noto Sans TC', sans-serif !important;
+    }
+    
+    :root {
+        --primary: #004a99;
+        --primary-light: #1976d2;
+        --accent: #ff6b35;
+        --success: #10b981;
+        --warning: #f59e0b;
+        --danger: #ef4444;
+    }
+
+    .stButton > button {
+        background-color: var(--primary);
+        color: white;
+        border-radius: 8px;
+        font-weight: 600;
+        border: none;
+        padding: 0.5rem 1rem;
+        transition: all 0.2s;
+        width: 100%;
+        font-family: 'Noto Sans TC', sans-serif !important;
+    }
+    .stButton > button:hover {
+        background-color: var(--primary-light);
+        transform: translateY(-1px);
+    }
+    .stButton > button[kind="primary"] {
+        background-color: var(--accent);
+    }
+
+    .progress-bar {
+        background: #e0e7ff;
+        border-radius: 10px;
+        height: 20px;
+        overflow: hidden;
+        margin: 6px 0;
+    }
+    .progress-fill {
+        background: linear-gradient(90deg, #004a99, #1976d2);
+        height: 100%;
+        border-radius: 10px;
+        transition: width 0.5s;
+        text-align: right;
+        color: white;
+        font-weight: bold;
+        padding-right: 6px;
+        line-height: 20px;
+        font-size: 12px;
+    }
+
+    .info-card {
+        background: #f8fafc;
+        border-left: 3px solid var(--primary);
+        padding: 10px 14px;
+        border-radius: 6px;
+        margin: 8px 0;
+        font-size: 14px;
+    }
+
+    /* 隱藏 Streamlit 的「Manage app」按鈕和選單（避免外人看到） */
+    button[kind="header"] { display: none !important; }
+    [data-testid="stToolbar"] { display: none !important; }
+    [data-testid="stDecoration"] { display: none !important; }
+    footer { visibility: hidden !important; }
+    #MainMenu { visibility: hidden !important; }
+    .stDeployButton { display: none !important; }
+    
+    /* 縮小 metric 卡片字體 */
+    [data-testid="stMetricValue"] { font-size: 28px !important; }
+    [data-testid="stMetricLabel"] { font-size: 13px !important; }
+    
+    /* 縮小 header 大小 */
+    h1 { font-size: 26px !important; margin-bottom: 0.4rem !important; }
+    h2 { font-size: 22px !important; margin-bottom: 0.4rem !important; }
+    h3 { font-size: 18px !important; margin-bottom: 0.3rem !important; }
+    
+    /* 主內容區縮小 padding */
+    .block-container { padding-top: 1.5rem !important; padding-bottom: 1rem !important; }
+</style>
+
+<link rel="apple-touch-icon" href="https://emojicdn.elk.sh/🎓?style=apple">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="AI Tutor">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# 3. SQLite 資料庫
+# ============================================================
+
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS wrong_book (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL, subject TEXT NOT NULL, topic TEXT,
+            question TEXT NOT NULL, my_answer TEXT, correct_answer TEXT,
+            note TEXT, reviewed INTEGER DEFAULT 0, review_count INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS score_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL, subject TEXT NOT NULL, score INTEGER NOT NULL,
+            exam_type TEXT, note TEXT
+        );
+        CREATE TABLE IF NOT EXISTS daily_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL, subject TEXT,
+            questions_done INTEGER DEFAULT 0, minutes_spent INTEGER DEFAULT 0, note TEXT
+        );
+        CREATE TABLE IF NOT EXISTS cat_photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uploaded_at TEXT NOT NULL, photo_data BLOB NOT NULL, caption TEXT
+        );
+        CREATE TABLE IF NOT EXISTS cat_profile (
+            id INTEGER PRIMARY KEY, cat_name TEXT, cat_personality TEXT, updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS api_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL, engine TEXT NOT NULL,
+            input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+            estimated_cost_usd REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS parent_settings (
+            key TEXT PRIMARY KEY, value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS achievement_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            month TEXT NOT NULL, condition_name TEXT, achieved INTEGER, note TEXT
+        );
+        """)
+
+
+def get_setting(key, default=""):
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM parent_settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key, value):
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO parent_settings (key, value) VALUES (?,?)", (key, str(value)))
+
+
+def add_wrong(subject, topic, question, my_ans, correct_ans, note):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO wrong_book (date, subject, topic, question, my_answer, correct_answer, note) VALUES (?,?,?,?,?,?,?)",
+            (str(date.today()), subject, topic, question, my_ans, correct_ans, note))
+
+
+def get_wrongs(subject=None, only_unreviewed=True):
+    with get_db() as conn:
+        sql = "SELECT * FROM wrong_book WHERE 1=1"
+        params = []
+        if subject:
+            sql += " AND subject=?"
+            params.append(subject)
+        if only_unreviewed:
+            sql += " AND reviewed=0"
+        sql += " ORDER BY date DESC"
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def mark_reviewed(wrong_id):
+    with get_db() as conn:
+        conn.execute("UPDATE wrong_book SET reviewed=1, review_count=review_count+1 WHERE id=?", (wrong_id,))
+
+
+def add_score(subject, score, exam_type, note):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO score_log (date, subject, score, exam_type, note) VALUES (?,?,?,?,?)",
+            (str(date.today()), subject, score, exam_type, note))
+
+
+def get_scores(subject=None):
+    with get_db() as conn:
+        if subject:
+            return [dict(r) for r in conn.execute("SELECT * FROM score_log WHERE subject=? ORDER BY date DESC", (subject,)).fetchall()]
+        return [dict(r) for r in conn.execute("SELECT * FROM score_log ORDER BY date DESC").fetchall()]
+
+
+def log_daily(subject, q_count, minutes, note=""):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO daily_log (date, subject, questions_done, minutes_spent, note) VALUES (?,?,?,?,?)",
+            (str(date.today()), subject, q_count, minutes, note))
+
+
+def get_today_done():
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT subject, SUM(questions_done) as qs, SUM(minutes_spent) as mins FROM daily_log WHERE date=? GROUP BY subject",
+            (str(date.today()),)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_month_stats():
+    """取得本月（自然月 5/1~5/31）的學習統計"""
+    month_start = date.today().replace(day=1)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT SUM(questions_done) as total_q, SUM(minutes_spent) as total_m FROM daily_log WHERE date>=?",
+            (str(month_start),)).fetchone()
+        return {
+            "questions": row["total_q"] or 0,
+            "minutes": row["total_m"] or 0,
+        }
+
+
+def export_db_json():
+    data = {}
+    with get_db() as conn:
+        for table in ["wrong_book", "score_log", "daily_log", "cat_profile", "achievement_log"]:
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            data[table] = [dict(r) for r in rows]
+    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+
+def add_cat_photo(photo_bytes, caption=""):
+    with get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM cat_photos").fetchone()[0]
+        if count >= 6:
+            conn.execute("DELETE FROM cat_photos WHERE id = (SELECT MIN(id) FROM cat_photos)")
+        conn.execute(
+            "INSERT INTO cat_photos (uploaded_at, photo_data, caption) VALUES (?,?,?)",
+            (str(datetime.now()), photo_bytes, caption))
+
+
+def get_cat_photos():
+    with get_db() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM cat_photos ORDER BY id DESC").fetchall()]
+
+
+def delete_cat_photo(photo_id):
+    with get_db() as conn:
+        conn.execute("DELETE FROM cat_photos WHERE id=?", (photo_id,))
+
+
+def get_cat_profile():
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM cat_profile WHERE id=1").fetchone()
+        if row:
+            return dict(row)
+        return {
+            "cat_name": st.secrets.get("CAT_NAME", "小貓"),
+            "cat_personality": st.secrets.get("CAT_PERSONALITY", "可愛溫暖的貓咪"),
+        }
+
+
+def save_cat_profile(name, personality):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO cat_profile (id, cat_name, cat_personality, updated_at) VALUES (1,?,?,?)",
+            (name, personality, str(datetime.now())))
+
+
+def get_streak_days(daily_target):
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT date, SUM(questions_done) as total
+            FROM daily_log GROUP BY date ORDER BY date DESC LIMIT 30
+        """).fetchall()
+    streak = 0
+    today = date.today()
+    for r in rows:
+        row_date = datetime.strptime(r["date"], "%Y-%m-%d").date()
+        if row_date == today - timedelta(days=streak) and (r["total"] or 0) >= daily_target:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+PRICING = {
+    "Claude": {"input": 3.0 / 1_000_000, "output": 15.0 / 1_000_000},
+    "Gemini": {"input": 1.25 / 1_000_000, "output": 5.0 / 1_000_000},
+}
+
+
+def log_api_usage(engine, input_tokens, output_tokens):
+    cost = (input_tokens * PRICING[engine]["input"] + output_tokens * PRICING[engine]["output"])
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO api_usage (date, engine, input_tokens, output_tokens, estimated_cost_usd) VALUES (?,?,?,?,?)",
+            (str(date.today()), engine, input_tokens, output_tokens, cost))
+    return cost
+
+
+def get_usage_stats():
+    """以自然月計算（5/1~5/31）"""
+    month_start = date.today().replace(day=1)
+    with get_db() as conn:
+        today_cost = conn.execute(
+            "SELECT SUM(estimated_cost_usd) FROM api_usage WHERE date=?",
+            (str(date.today()),)).fetchone()[0] or 0
+        month_cost = conn.execute(
+            "SELECT SUM(estimated_cost_usd) FROM api_usage WHERE date>=?",
+            (str(month_start),)).fetchone()[0] or 0
+        today_calls = conn.execute(
+            "SELECT COUNT(*) FROM api_usage WHERE date=?",
+            (str(date.today()),)).fetchone()[0]
+    return {
+        "today_usd": today_cost,
+        "today_twd": today_cost * USD_TO_TWD,
+        "month_usd": month_cost,
+        "month_twd": month_cost * USD_TO_TWD,
+        "today_calls": today_calls,
+    }
+
+
+init_db()
+
+
+# ============================================================
+# 4. 密碼驗證機制
+# ============================================================
+
+def check_app_password():
+    """主 App 登入密碼驗證"""
+    if not APP_PASSWORD:
+        return True  # 沒設密碼就直接放行
+    
+    if st.session_state.get("app_authenticated"):
+        return True
+    
+    # 顯示登入畫面
+    st.markdown("""
+    <div style="max-width:420px; margin:60px auto; padding:30px; background:#f8fafc; border-radius:14px; text-align:center; box-shadow:0 4px 12px rgba(0,0,0,0.08);">
+        <div style="font-size:48px;">🎓</div>
+        <h2 style="color:#004a99; margin:12px 0;">學測導航</h2>
+        <p style="color:#666; font-size:14px;">請輸入密碼進入</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        password = st.text_input("密碼", type="password", key="app_pwd_input", label_visibility="collapsed", placeholder="請輸入密碼")
+        if st.button("🔓 進入 App", type="primary", use_container_width=True):
+            if password == APP_PASSWORD:
+                st.session_state.app_authenticated = True
+                st.rerun()
+            else:
+                st.error("❌ 密碼錯誤")
+    
+    return False
+
+
+def check_parent_password():
+    """家長後台密碼驗證"""
+    if st.session_state.get("parent_authenticated"):
+        return True
+    
+    st.markdown("### 🔐 家長後台登入")
+    st.caption("此區域僅供家長使用")
+    
+    password = st.text_input("家長密碼", type="password", key="parent_pwd_input")
+    if st.button("🔓 進入家長後台", type="primary"):
+        if password == PARENT_PASSWORD and PARENT_PASSWORD:
+            st.session_state.parent_authenticated = True
+            st.rerun()
+        else:
+            st.error("❌ 密碼錯誤，僅家長能進入")
+    
+    return False
+
+
+# 檢查主 App 密碼
+if not check_app_password():
+    st.stop()
+
+
+# ============================================================
+# 5. 學習階段判定（含混合策略）
+# ============================================================
+
+def get_phase(today=None):
+    if today is None:
+        today = date.today()
+    days_left = max((EXAM_DATE - today).days, 0)
+    days_passed = max((today - START_DATE).days, 0)
+    total_days = (EXAM_DATE - START_DATE).days
+    progress_pct = min(int(days_passed / total_days * 100), 100)
+
+    if today < date(2026, 7, 1):
+        # Phase 1：5-6 月
+        return {
+            "phase": "Phase 1：補洞期", "focus": "9 科段考準備 + 補弱點",
+            "daily_target": 25, "subjects": ALL_SUBJECTS,  # 9 科都要
+            "days_left": days_left, "progress_pct": progress_pct, "emoji": "🌱",
+            "strategy": "跟學校進度走，平日 9 科都要顧",
+        }
+    elif today < date(2026, 10, 1):
+        # Phase 2：暑假
+        return {
+            "phase": "Phase 2：暑假黃金期", "focus": "學測 5 科火力集中",
+            "daily_target": 50, "subjects": EXAM_SUBJECTS,  # 學測重點
+            "days_left": days_left, "progress_pct": progress_pct, "emoji": "🔥",
+            "strategy": "全範圍重新梳理，火力集中（決勝負期）",
+        }
+    elif today < date(2026, 12, 25):
+        # Phase 3：模考
+        return {
+            "phase": "Phase 3：模考衝刺", "focus": "學測歷屆題 + 計時訓練",
+            "daily_target": 60, "subjects": EXAM_SUBJECTS,
+            "days_left": days_left, "progress_pct": progress_pct, "emoji": "⚡",
+            "strategy": "歷屆學測 + 模擬考訓練",
+        }
+    else:
+        # Phase 4：精修
+        return {
+            "phase": "Phase 4：考前精修", "focus": "錯題本回顧 + 心態維持",
+            "daily_target": 20, "subjects": EXAM_SUBJECTS,
+            "days_left": days_left, "progress_pct": progress_pct, "emoji": "🎯",
+            "strategy": "只回顧錯題本，保持手感",
+        }
+
+
+# ============================================================
+# 6. AI 引擎（升級到 Gemini 2.0）
+# ============================================================
+
+@st.cache_resource
+def get_claude_client():
+    try:
+        from anthropic import Anthropic
+        api_key = st.secrets.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            return None
+        return Anthropic(api_key=api_key)
+    except ImportError:
+        return None
+
+
+@st.cache_resource
+def get_gemini_model():
+    try:
+        import google.generativeai as genai
+        api_key = st.secrets.get("GOOGLE_API_KEY")
+        if not api_key:
+            return None
+        genai.configure(api_key=api_key)
+        return genai.GenerativeModel("gemini-2.0-flash-exp")
+    except ImportError:
+        return None
+
+
+def ask_ai(prompt, system="", engine="Gemini"):
+    default_system = f"你是一位資深的台灣高中升大學家教老師，熟悉 108 課綱與大學學測歷屆題型。學生暱稱「{NICKNAME}」。回答用繁體中文，內容要清楚、有條理、有解題思路。"
+    system = system or default_system
+
+    usage = get_usage_stats()
+    monthly_limit = float(st.secrets.get("MONTHLY_BUDGET_USD", "20"))
+    if usage["month_usd"] >= monthly_limit:
+        return f"⚠️ 已達本月 API 預算上限 NT${monthly_limit*USD_TO_TWD:.0f}（目前已用 NT${usage['month_twd']:.0f}）。請等下個月或請家長調整預算。"
+
+    if engine == "Claude":
+        client = get_claude_client()
+        if not client:
+            return "❌ 尚未設定 ANTHROPIC_API_KEY，請至 Settings → Secrets 新增。"
+        try:
+            msg = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=4096,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            log_api_usage("Claude", msg.usage.input_tokens, msg.usage.output_tokens)
+            return msg.content[0].text
+        except Exception as e:
+            return f"❌ Claude 錯誤：{type(e).__name__} — {str(e)}"
+    else:
+        model = get_gemini_model()
+        if not model:
+            return "❌ 尚未設定 GOOGLE_API_KEY，請至 Settings → Secrets 新增。"
+        try:
+            import google.generativeai as genai
+            model_with_sys = genai.GenerativeModel(
+                "gemini-2.0-flash-exp", system_instruction=system
+            )
+            response = model_with_sys.generate_content(prompt)
+            try:
+                in_tokens = response.usage_metadata.prompt_token_count
+                out_tokens = response.usage_metadata.candidates_token_count
+            except:
+                in_tokens = len(prompt) // 3
+                out_tokens = len(response.text) // 3
+            log_api_usage("Gemini", in_tokens, out_tokens)
+            return response.text
+        except Exception as e:
+            return f"❌ Gemini 錯誤：{type(e).__name__} — {str(e)}"
+
+
+# ============================================================
+# 7. 達標獎勵系統（家長後台控制）
+# ============================================================
+
+def get_reward_enabled():
+    """獎勵系統是否啟用（家長後台控制）"""
+    return get_setting("reward_enabled", "0") == "1"
+
+
+def get_achievement_status():
+    """計算當月達標進度"""
+    month_stats = get_month_stats()
+    month_target_q = int(get_setting("monthly_q_target", "600"))
+    
+    # 條件 1：學習量
+    cond_1 = month_stats["questions"] >= month_target_q
+    
+    # 條件 2：學校成績進步（手動填）
+    cond_2 = get_setting("month_school_improved", "0") == "1"
+    
+    # 條件 3：錯題複習率
+    with get_db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM wrong_book").fetchone()[0]
+        reviewed = conn.execute("SELECT COUNT(*) FROM wrong_book WHERE reviewed=1").fetchone()[0]
+    review_rate = (reviewed / total * 100) if total > 0 else 0
+    cond_3 = review_rate >= 60
+    
+    # 條件 4：家長心態評估
+    cond_4 = get_setting("month_attitude_ok", "0") == "1"
+    
+    achieved_count = sum([cond_1, cond_2, cond_3, cond_4])
+    
+    return {
+        "conditions": [
+            {"name": "學習量達標", "achieved": cond_1, "detail": f"{month_stats['questions']}/{month_target_q} 題"},
+            {"name": "學校成績進步", "achieved": cond_2, "detail": "由家長標記"},
+            {"name": "錯題複習率 ≥ 60%", "achieved": cond_3, "detail": f"{review_rate:.0f}%"},
+            {"name": "心態狀態良好", "achieved": cond_4, "detail": "由家長評估"},
+        ],
+        "achieved_count": achieved_count,
+        "total": 4,
+        "is_great": achieved_count >= 4,
+        "is_good": achieved_count >= 3,
+    }
+
+
+# ============================================================
+# 8. 側邊欄
+# ============================================================
+
+CAT_PHOTOS_DIR = Path("cat_photos")
+
+
+def get_builtin_cat_photos():
+    media = []
+    if CAT_PHOTOS_DIR.exists() and CAT_PHOTOS_DIR.is_dir():
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif"):
+            media.extend(sorted(CAT_PHOTOS_DIR.glob(ext)))
+        for ext in ("*.mp4", "*.webm", "*.mov"):
+            media.extend(sorted(CAT_PHOTOS_DIR.glob(ext)))
+    return media
+
+
+def is_video(file_path):
+    return str(file_path).lower().endswith(('.mp4', '.webm', '.mov'))
+
+
+def get_media_mime(file_path):
+    ext = str(file_path).lower().split('.')[-1]
+    return {
+        'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+        'png': 'image/png', 'webp': 'image/webp', 'gif': 'image/gif',
+        'mp4': 'video/mp4', 'webm': 'video/webm', 'mov': 'video/quicktime',
+    }.get(ext, 'application/octet-stream')
+
+
+phase_info = get_phase()
+
+with st.sidebar:
+    cat_profile = get_cat_profile()
+    cat_photos = get_cat_photos()
+    builtin_photos = get_builtin_cat_photos()
+    streak = get_streak_days(phase_info["daily_target"])
+
+    photo_b64 = None
+    media_type = "image"
+    media_mime = "image/jpeg"
+    all_options = []
+
+    for p in builtin_photos:
+        all_options.append(("builtin", p))
+    for p in cat_photos:
+        all_options.append(("uploaded", p))
+
+    if all_options:
+        source_type, chosen = random.choice(all_options)
+        if source_type == "builtin":
+            with open(chosen, "rb") as f:
+                photo_b64 = base64.b64encode(f.read()).decode()
+            media_type = "video" if is_video(chosen) else "image"
+            media_mime = get_media_mime(chosen)
+        else:
+            photo_b64 = base64.b64encode(chosen["photo_data"]).decode()
+            media_type = "image"
+            media_mime = "image/jpeg"
+
+    if photo_b64:
+        today_done = sum(t["qs"] or 0 for t in get_today_done())
+        target = phase_info["daily_target"]
+        cat_name = cat_profile["cat_name"]
+        if today_done >= target:
+            cat_mood = "😻"
+            cat_says = f"{NICKNAME} 今天好棒！已完成 {today_done} 題～"
+        elif today_done >= target * 0.5:
+            cat_says = f"喵～繼續加油！還差 {target - today_done} 題達標！"
+            cat_mood = "🐱"
+        elif today_done > 0:
+            cat_says = f"喵嗚～你已做了 {today_done} 題，再 push 一下！"
+            cat_mood = "😺"
+        else:
+            cat_says = f"主人～{cat_name} 在等你開始念書喔！"
+            cat_mood = "😿"
+
+        if media_type == "video":
+            media_html = f'<video autoplay loop muted playsinline style="width:110px; height:110px; object-fit:cover; border-radius:50%; border:3px solid #ff6b35; box-shadow:0 4px 10px rgba(0,0,0,0.1);"><source src="data:{media_mime};base64,{photo_b64}" type="{media_mime}"></video>'
+        else:
+            media_html = f'<img src="data:{media_mime};base64,{photo_b64}" style="width:110px; height:110px; object-fit:cover; border-radius:50%; border:3px solid #ff6b35; box-shadow:0 4px 10px rgba(0,0,0,0.1);">'
+
+        streak_html = f'<div style="margin-top:5px; font-size:11px; color:#ff6b35; font-weight:bold;">🔥 連續達標 {streak} 天</div>' if streak > 0 else ''
+
+        sidebar_html = (
+            f'<div style="text-align:center; padding:10px; background:linear-gradient(135deg,#fff3e0,#ffe0b2); border-radius:10px; margin-bottom:10px;">'
+            f'{media_html}'
+            f'<div style="margin-top:6px; font-weight:bold; color:#d84315; font-size:14px;">{cat_mood} {cat_name}</div>'
+            f'<div style="font-size:12px; color:#5d4037; margin-top:3px; padding:0 6px;">"{cat_says}"</div>'
+            f'{streak_html}'
+            f'</div>'
+        )
+        st.markdown(sidebar_html, unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div style="text-align:center; padding:16px; background:#fff3e0; border-radius:10px; margin-bottom:10px;">'
+            '<div style="font-size:36px;">🐱</div>'
+            '<div style="font-size:12px; color:#5d4037; margin-top:6px;">到「🐱 我的貓咪」上傳照片！</div>'
+            '</div>', unsafe_allow_html=True)
+
+    st.title(f"🎓 {NICKNAME} 學測導航")
+
+    # AI 引擎切換（標示免費 vs 計費）
+    engine = st.radio(
+        "🤖 AI 引擎",
+        ["Gemini", "Claude"],
+        format_func=lambda x: "🟢 Gemini（免費）" if x == "Gemini" else "🔴 Claude（計費）",
+        help="Gemini：免費、速度快、適合一般練習｜Claude：題目品質高、計費、適合深度學習",
+        horizontal=False,
+    )
+
+    usage = get_usage_stats()
+    if usage["today_calls"] > 0:
+        st.caption(f"📊 今日 {usage['today_calls']} 次｜花費 NT${usage['today_twd']:.0f}")
+
+    st.divider()
+
+    # 年級 + 科目選擇
+    grade = st.selectbox("年級", ["高二", "高三"], index=0 if USER["DEFAULT_GRADE"] == "高二" else 1)
+    
+    # 顯示哪些科目（依階段）
+    available_subjects = phase_info["subjects"]
+    subject = st.selectbox("科目", available_subjects)
+    
+    publisher = TEXTBOOK.get(subject, {}).get(grade, "通用版")
+
+    school_label = f"{SCHOOL_NAME} " if SCHOOL_NAME else ""
+    st.markdown(f'<div class="info-card">📚 {school_label}<b>{publisher}版</b><br>{grade} {subject}</div>', unsafe_allow_html=True)
+
+    st.divider()
+
+    page = st.radio(
+        "功能選單",
+        ["🏠 今日任務", "📝 刷題練習", "🧠 蘇格拉底引導",
+         "📓 錯題本", "📊 進度追蹤", "🐱 我的貓咪",
+         "💰 費用監控", "💾 資料備份", "🔐 家長後台"],
+    )
+
+
+# ============================================================
+# 9. 頂部資訊欄（精簡版）
+# ============================================================
+
+st.markdown(f"""
+<div style="background: linear-gradient(135deg, #004a99, #1976d2); color: white; padding: 12px 16px; border-radius: 10px; margin-bottom: 14px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+        <div>
+            <div style="font-size: 12px; opacity: 0.85;">距 {EXAM_YEAR} 學測</div>
+            <div style="font-size: 26px; font-weight: bold; line-height: 1;">{phase_info['days_left']} 天</div>
+        </div>
+        <div>
+            <div style="font-size: 12px; opacity: 0.85;">{phase_info['emoji']} {phase_info['phase']}</div>
+            <div style="font-size: 14px; font-weight: 500;">{phase_info['focus']}</div>
+        </div>
+        <div style="text-align: right;">
+            <div style="font-size: 12px; opacity: 0.85;">每日目標</div>
+            <div style="font-size: 22px; font-weight: bold;">{phase_info['daily_target']} 題</div>
+        </div>
+    </div>
+    <div style="margin-top: 8px;">
+        <div class="progress-bar" style="background: rgba(255,255,255,0.2); height: 6px;">
+            <div style="width: {phase_info['progress_pct']}%; height: 100%; background: linear-gradient(90deg, #ff6b35, #ffa726); border-radius: 10px;"></div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# 10. 頁面分流
+# ============================================================
+
+# ---------- 🏠 今日任務 ----------
+if page == "🏠 今日任務":
+    st.header(f"🏠 {NICKNAME}，今天該做什麼？")
+
+    today_done = get_today_done()
+    total_done = sum(t["qs"] or 0 for t in today_done)
+    total_mins = sum(t["mins"] or 0 for t in today_done)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("今日題數", f"{total_done}", f"目標 {phase_info['daily_target']}")
+    with col2:
+        st.metric("今日讀書", f"{total_mins} 分", f"{total_mins // 60} 小時")
+    with col3:
+        completion = min(int(total_done / phase_info['daily_target'] * 100), 100) if phase_info['daily_target'] else 0
+        st.metric("完成度", f"{completion}%", "💪 加油" if completion < 100 else "✅ 達標")
+
+    # 顯示獎勵進度（如果家長啟用）
+    if get_reward_enabled():
+        st.divider()
+        st.subheader("🏆 本月達標進度")
+        ach = get_achievement_status()
+        for cond in ach["conditions"]:
+            icon = "✅" if cond["achieved"] else "⏳"
+            st.markdown(f"{icon} **{cond['name']}** — {cond['detail']}")
+        
+        st.markdown(f"""
+        <div class="info-card" style="border-left-color: {'#10b981' if ach['is_great'] else '#f59e0b'};">
+        🎯 進度：<b>{ach['achieved_count']} / 4</b>
+        {' — ⭐ 月度標準達成！' if ach['is_good'] else ''}
+        {' — 🏆 滿分達標！家長會看到這份努力 ❤️' if ach['is_great'] else ''}
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.divider()
+    st.subheader("📋 今日建議分配")
+    weakness_subjects = []
+    with get_db() as conn:
+        for s in phase_info["subjects"]:
+            wrong_count = conn.execute(
+                "SELECT COUNT(*) FROM wrong_book WHERE subject=? AND reviewed=0", (s,)
+            ).fetchone()[0]
+            if wrong_count > 0:
+                weakness_subjects.append((s, wrong_count))
+
+    weakness_subjects.sort(key=lambda x: -x[1])
+
+    if weakness_subjects:
+        st.markdown("**🎯 優先複習（依錯題數排序）**")
+        for s, cnt in weakness_subjects[:3]:
+            st.markdown(f"- **{s}**：{cnt} 題待複習")
+    else:
+        st.info(f"👍 目前沒有累積錯題，到「📝 刷題練習」開始今日 {phase_info['daily_target']} 題吧！")
+
+    st.divider()
+    st.subheader("✏️ 登錄今日進度")
+    with st.form("daily_log_form"):
+        log_subject = st.selectbox("科目", phase_info["subjects"], key="log_sub")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            log_qs = st.number_input("做了幾題", 0, 200, 10)
+        with col_b:
+            log_mins = st.number_input("花了幾分鐘", 0, 600, 30)
+        log_note = st.text_input("備註（選填）", placeholder="例如：第三章三角函數複習")
+        if st.form_submit_button("💾 記錄今日進度", type="primary"):
+            log_daily(log_subject, log_qs, log_mins, log_note)
+            st.success("✅ 已記錄！繼續加油！")
+            st.rerun()
+
+
+# ---------- 📝 刷題練習 ----------
+elif page == "📝 刷題練習":
+    st.header(f"📝 {publisher}版 {grade}{subject} — 刷題練習")
+    
+    # 數學雙軌提示
+    if subject == "數學A" and date.today() < date(2026, 7, 1):
+        st.info("💡 您正在練「數學 A」進階題（學測進階）。學校段考用「數學 B」喔！")
+    elif subject == "數學B":
+        st.info("💡 您正在練「數學 B」（學校段考用）。暑假後可以加練「數學 A」拚學測進階題！")
+
+    last_scores = get_scores(subject)
+    boost_hint = ""
+    if last_scores and last_scores[0]["score"] < 80:
+        last = last_scores[0]
+        boost_hint = f"（{NICKNAME} 上次 {subject} 得分為 {last['score']} 分。請出修正與強化版題目，幫她從 {last['score']} 進步到 80+。）"
+        st.warning(f"📈 偵測到上次 {subject} 得 {last['score']} 分，已開啟「進步衝刺模式」")
+
+    # 章節下拉選單（取代手動輸入）
+    chapter_options = get_chapters(subject, grade)
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        chapter_choice = st.selectbox(
+            "本次範圍 / 章節",
+            chapter_options,
+            help="選擇章節讓 AI 出更精準的題目；選「自訂」可手動輸入"
+        )
+        # 自訂章節時才顯示輸入框
+        if chapter_choice == "✏️ 自訂":
+            chapter = st.text_input("自訂章節內容", placeholder="例如：第三章 三角函數和角公式")
+        else:
+            chapter = chapter_choice
+    
+    with col2:
+        difficulty = st.selectbox("難度", ["基礎", "中等", "進階", "挑戰學測"])
+
+    col3, col4 = st.columns(2)
+    with col3:
+        num_q = st.slider("題數", 5, 30, 15)
+    with col4:
+        include_essay = st.checkbox("含非選擇題", value=True)
+
+    if st.button("🚀 生成練習題", type="primary"):
+        if not chapter or chapter == "✏️ 自訂":
+            st.warning("請先選擇章節或輸入自訂內容")
+        else:
+            extra = ""
+            if subject in ["數學A", "數學B"] and include_essay:
+                extra = "請務必包含選填題與計算題。"
+            elif include_essay:
+                extra = "請包含至少 3 題非選擇題。"
+
+            prompt = f"""
+請幫高中生 {NICKNAME} 出 {num_q} 題 **{subject}** 練習題。{boost_hint}
+
+【教材】{publisher}版 {grade}{subject}
+【範圍】{chapter}
+【難度】{difficulty}
+【格式】
+1. 題型混合：選擇題 + 非選擇題。{extra}
+2. 仿照大學學測 108 課綱題型（情境化、跨領域）
+3. 全部題目先列出，編號 1, 2, 3...
+4. 用「---詳解---」分隔，再給每題詳解
+5. 詳解要包含：解題思路、易錯點、相關觀念連結
+6. 不要先給答案，讓她答完再對
+"""
+            with st.spinner(f"{engine} 正在出題中..."):
+                result = ask_ai(prompt, engine=engine)
+                st.session_state.last_quiz = result
+                st.session_state.last_subject = subject
+                st.session_state.last_topic = chapter
+
+    if "last_quiz" in st.session_state:
+        st.divider()
+        st.markdown(st.session_state.last_quiz)
+
+        st.divider()
+        with st.expander("✏️ 把答錯的題目加入錯題本"):
+            with st.form("add_wrong_form"):
+                w_q = st.text_area("題目", height=100)
+                w_my = st.text_input("我的答案")
+                w_correct = st.text_input("正確答案")
+                w_note = st.text_input("錯誤原因", placeholder="觀念混淆？粗心？不會？")
+                if st.form_submit_button("📌 加入錯題本"):
+                    if w_q.strip():
+                        add_wrong(
+                            st.session_state.last_subject,
+                            st.session_state.last_topic,
+                            w_q, w_my, w_correct, w_note
+                        )
+                        st.success("✅ 已加入錯題本！")
+
+
+# ---------- 🧠 蘇格拉底引導 ----------
+elif page == "🧠 蘇格拉底引導":
+    st.header("🧠 蘇格拉底解題引導")
+    st.caption("📌 不直接給答案，AI 會用追問方式帶你自己想出來。")
+
+    if "socratic_history" not in st.session_state:
+        st.session_state.socratic_history = []
+        st.session_state.socratic_question = ""
+
+    if not st.session_state.socratic_history:
+        question = st.text_area(
+            "貼上你卡住的題目",
+            placeholder="完整題目越詳細越好",
+            height=180,
+        )
+        if st.button("🎯 開始引導", type="primary") and question.strip():
+            st.session_state.socratic_question = question
+            system_prompt = f"""你是一位耐心的家教老師 Tutor，用蘇格拉底引導法幫 {NICKNAME} 解 {subject} 題目。
+
+【鐵律】
+1. 絕對不可以直接給答案
+2. 用「提問」引導她思考，每次只問 1-2 個關鍵問題
+3. 從她的回答判斷她卡在哪一步
+4. 答對中間步驟就肯定她、繼續引導下一步
+5. 答錯不要直接糾正，反問「你為什麼這樣想？」或提示她檢查某個條件
+6. 語氣溫和像鄰家姊姊，但保持專業
+7. 最後她算出答案時，幫她回顧整題的關鍵觀念
+"""
+            first = ask_ai(
+                f"題目如下：\n\n{question}\n\n請開始你的第一個引導問題。",
+                system=system_prompt, engine=engine,
+            )
+            st.session_state.socratic_history.append(("ai", first))
+            st.session_state.socratic_system = system_prompt
+            st.rerun()
+    else:
+        st.markdown(f'<div class="info-card">📋 <b>題目</b><br>{st.session_state.socratic_question}</div>', unsafe_allow_html=True)
+
+        for role, msg in st.session_state.socratic_history:
+            with st.chat_message("assistant" if role == "ai" else "user"):
+                st.markdown(msg)
+
+        user_input = st.chat_input("輸入你的想法 / 嘗試...")
+        if user_input:
+            st.session_state.socratic_history.append(("user", user_input))
+            convo = f"題目：{st.session_state.socratic_question}\n\n對話歷程：\n"
+            for role, msg in st.session_state.socratic_history:
+                convo += f"\n【{'學生' if role == 'user' else '老師'}】{msg}\n"
+            convo += "\n【請以老師身份繼續引導】"
+            reply = ask_ai(convo, system=st.session_state.socratic_system, engine=engine)
+            st.session_state.socratic_history.append(("ai", reply))
+            st.rerun()
+
+        if st.button("🔄 換一題"):
+            st.session_state.socratic_history = []
+            st.session_state.socratic_question = ""
+            st.rerun()
+
+
+# ---------- 📓 錯題本 ----------
+elif page == "📓 錯題本":
+    st.header("📓 我的錯題本")
+
+    tab1, tab2 = st.tabs(["📋 錯題清單", "🔁 智慧複習"])
+
+    with tab1:
+        filter_sub = st.selectbox("篩選科目", ["全部"] + ALL_SUBJECTS)
+        show_reviewed = st.checkbox("顯示已複習")
+
+        wrongs = get_wrongs(
+            subject=None if filter_sub == "全部" else filter_sub,
+            only_unreviewed=not show_reviewed,
+        )
+
+        if not wrongs:
+            st.info("錯題本還是空的，到「刷題練習」累積錯題吧！")
+        else:
+            st.write(f"共 **{len(wrongs)}** 題")
+            for w in wrongs:
+                with st.expander(
+                    f"#{w['id']} [{w['date']}] {w['subject']} — {w['topic']} "
+                    f"{'✅ 已複習' if w['reviewed'] else '⏳ 待複習'}"
+                ):
+                    st.markdown(f"**題目**：\n\n{w['question']}")
+                    st.markdown(f"**我的答案**：{w['my_answer']}")
+                    st.markdown(f"**正確答案**：{w['correct_answer']}")
+                    st.markdown(f"**錯誤原因**：{w['note']}")
+
+                    cols = st.columns(2)
+                    with cols[0]:
+                        if not w["reviewed"]:
+                            if st.button(f"✅ 標為已複習", key=f"rev_{w['id']}"):
+                                mark_reviewed(w["id"])
+                                st.rerun()
+                    with cols[1]:
+                        if st.button(f"🤖 請 AI 重新講解", key=f"explain_{w['id']}"):
+                            with st.spinner("AI 講解中..."):
+                                exp = ask_ai(
+                                    f"請為高中生講解這題：\n\n{w['question']}\n\n"
+                                    f"她當時答：{w['my_answer']}（錯）\n"
+                                    f"正確答案：{w['correct_answer']}\n\n"
+                                    f"請說明：1) 她錯在哪 2) 正確思路 3) 同類型題怎麼判斷",
+                                    engine=engine,
+                                )
+                                st.markdown(exp)
+
+    with tab2:
+        st.subheader("🔁 依錯題本生成補強考卷")
+        target_sub = st.selectbox("選擇科目", ALL_SUBJECTS, key="boost_sub")
+        target_wrongs = get_wrongs(subject=target_sub, only_unreviewed=True)
+
+        if not target_wrongs:
+            st.info(f"{target_sub} 沒有未複習的錯題")
+        else:
+            st.write(f"📌 將依 {len(target_wrongs)} 題錯題分析弱點，生成 15 題補強練習")
+            if st.button("🧨 生成補強卷", type="primary"):
+                summary = "\n".join([
+                    f"- 主題：{w['topic']}；題目：{w['question'][:100]}；錯因：{w['note']}"
+                    for w in target_wrongs[:10]
+                ])
+                target_publisher = TEXTBOOK.get(target_sub, {}).get(grade, "通用版")
+                prompt = f"""
+以下是 {NICKNAME} 在 {target_sub} 的錯題紀錄。請：
+1. 先用 3 句話分析她的核心弱點
+2. 出 15 題「同觀念但不同情境」的補強練習
+3. 由淺入深：5 題基礎、5 題中等、5 題進階
+4. 每題後附詳解，特別點出「為什麼之前會錯」
+
+【教材】{target_publisher}版 {grade}{target_sub}
+【錯題】
+{summary}
+"""
+                with st.spinner("AI 分析弱點中..."):
+                    st.markdown(ask_ai(prompt, engine=engine))
+
+
+# ---------- 📊 進度追蹤 ----------
+elif page == "📊 進度追蹤":
+    st.header("📊 學習進度追蹤")
+
+    tab1, tab2, tab3 = st.tabs(["📈 分數趨勢", "📅 每日紀錄", "📊 月度報告"])
+
+    with tab1:
+        with st.expander("➕ 新增測驗分數"):
+            with st.form("score_form"):
+                s_sub = st.selectbox("科目", ALL_SUBJECTS)
+                s_score = st.number_input("分數", 0, 100, 75)
+                s_type = st.selectbox("測驗類型", ["學校段考", "模擬考", "AI 練習卷", "歷屆學測"])
+                s_note = st.text_input("備註")
+                if st.form_submit_button("儲存", type="primary"):
+                    add_score(s_sub, s_score, s_type, s_note)
+                    st.success("已記錄！")
+                    st.rerun()
+
+        st.subheader("各科最新成績")
+        all_scores = get_scores()
+        if all_scores:
+            latest = {}
+            for s in all_scores:
+                if s["subject"] not in latest:
+                    latest[s["subject"]] = s
+
+            cols = st.columns(min(len(latest), 4))
+            for i, (sub, entry) in enumerate(latest.items()):
+                with cols[i % 4]:
+                    delta_text = ""
+                    sub_history = [s for s in all_scores if s["subject"] == sub]
+                    if len(sub_history) >= 2:
+                        delta = sub_history[0]["score"] - sub_history[1]["score"]
+                        delta_text = f"{'+' if delta >= 0 else ''}{delta}"
+                    st.metric(sub, f"{entry['score']} 分", delta_text)
+
+            st.divider()
+            st.subheader("完整紀錄")
+            for s in all_scores[:20]:
+                st.markdown(
+                    f"- **{s['date']}** | {s['subject']} | "
+                    f"**{s['score']}** 分 | {s['exam_type']} | {s['note']}"
+                )
+        else:
+            st.info("還沒有分數紀錄")
+
+    with tab2:
+        st.subheader("📅 每日讀書紀錄")
+        with get_db() as conn:
+            recent = conn.execute(
+                "SELECT date, SUM(questions_done) as qs, SUM(minutes_spent) as mins "
+                "FROM daily_log WHERE date >= ? GROUP BY date ORDER BY date DESC",
+                (str(date.today() - timedelta(days=14)),),
+            ).fetchall()
+
+        if recent:
+            for r in recent:
+                pct = min(int((r["qs"] or 0) / phase_info["daily_target"] * 100), 100)
+                st.markdown(f"**{r['date']}** — {r['qs']} 題 / {r['mins']} 分鐘")
+                st.markdown(f'<div class="progress-bar"><div class="progress-fill" style="width: {pct}%">{pct}%</div></div>', unsafe_allow_html=True)
+        else:
+            st.info("最近 14 天還沒有讀書紀錄。到「今日任務」登錄今天的進度！")
+
+    with tab3:
+        st.subheader(f"📊 {date.today().strftime('%Y 年 %m 月')} 月度報告")
+        month_stats = get_month_stats()
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("本月題數", f"{month_stats['questions']}")
+        with col2:
+            st.metric("本月時數", f"{month_stats['minutes'] // 60} 小時")
+        with col3:
+            st.metric("平均每天", f"{month_stats['questions'] // max(date.today().day, 1)} 題")
+        
+        if get_reward_enabled():
+            st.divider()
+            ach = get_achievement_status()
+            st.subheader(f"🏆 達標進度：{ach['achieved_count']} / 4")
+            for cond in ach["conditions"]:
+                icon = "✅" if cond["achieved"] else "⏳"
+                st.markdown(f"{icon} **{cond['name']}** — {cond['detail']}")
+            
+            if ach["is_great"]:
+                st.success("🌟 滿分達標！本月你是月度學霸候選人！")
+            elif ach["is_good"]:
+                st.info("⭐ 月度標準達成！繼續加油！")
+        else:
+            st.caption("💡 達標獎勵系統目前未啟用")
+
+
+# ---------- 🐱 我的貓咪 ----------
+elif page == "🐱 我的貓咪":
+    st.header("🐱 我的貓咪夥伴")
+    st.caption("上傳貓咪照片，每次打開 App 都能看到牠陪你讀書 ❤️")
+
+    cat_profile = get_cat_profile()
+
+    with st.expander("✏️ 設定貓咪名字與個性", expanded=not cat_profile.get("cat_name")):
+        with st.form("cat_profile_form"):
+            cat_name = st.text_input("貓咪名字", value=cat_profile.get("cat_name", "小貓"))
+            cat_personality = st.text_area(
+                "貓咪個性描述",
+                value=cat_profile.get("cat_personality", "可愛溫暖的貓咪"),
+                placeholder="例如：很貪吃但很黏人的虎斑貓",
+                height=80,
+            )
+            if st.form_submit_button("💾 儲存", type="primary"):
+                save_cat_profile(cat_name, cat_personality)
+                st.success("已儲存！")
+                st.rerun()
+
+    st.divider()
+
+    builtin_photos = get_builtin_cat_photos()
+    if builtin_photos:
+        st.subheader(f"📂 GitHub 內建媒體（{len(builtin_photos)} 個）")
+        st.caption("💡 這些檔案放在 GitHub 的 `cat_photos/` 資料夾，永久保存。")
+
+        cols = st.columns(3)
+        for i, p in enumerate(builtin_photos):
+            with cols[i % 3]:
+                if is_video(p):
+                    st.video(str(p))
+                    st.caption(f"🎬 {p.name}")
+                else:
+                    with open(p, "rb") as f:
+                        st.image(f.read(), caption=f"📸 {p.name}", use_container_width=True)
+
+        st.divider()
+
+    st.subheader("📸 臨時上傳")
+    uploaded = st.file_uploader(
+        "選擇貓咪照片",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+    )
+
+    if uploaded:
+        for f in uploaded:
+            photo_bytes = f.read()
+            if len(photo_bytes) > 500_000:
+                try:
+                    from PIL import Image
+                    import io
+                    img = Image.open(io.BytesIO(photo_bytes))
+                    img.thumbnail((600, 600))
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    photo_bytes = buf.getvalue()
+                except ImportError:
+                    pass
+            add_cat_photo(photo_bytes, f.name)
+        st.success(f"✅ 已上傳 {len(uploaded)} 張照片！")
+        st.rerun()
+
+    photos = get_cat_photos()
+    if photos:
+        st.subheader(f"🖼️ 臨時上傳的照片（{len(photos)} 張）")
+        cols = st.columns(3)
+        for i, p in enumerate(photos):
+            with cols[i % 3]:
+                st.image(p["photo_data"], caption=p["caption"][:20], use_container_width=True)
+                if st.button("🗑️ 刪除", key=f"del_{p['id']}"):
+                    delete_cat_photo(p["id"])
+                    st.rerun()
+
+
+# ---------- 💰 費用監控（NT$ 為主）----------
+elif page == "💰 費用監控":
+    st.header("💰 API 費用監控")
+
+    usage = get_usage_stats()
+    monthly_limit_usd = float(st.secrets.get("MONTHLY_BUDGET_USD", "20"))
+    monthly_limit_twd = monthly_limit_usd * USD_TO_TWD
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("今日花費", f"NT${usage['today_twd']:.0f}", help=f"≈ ${usage['today_usd']:.3f} USD")
+    with col2:
+        month_pct = min(usage["month_usd"] / monthly_limit_usd * 100, 100) if monthly_limit_usd else 0
+        st.metric("本月花費", f"NT${usage['month_twd']:.0f}", f"預算 {month_pct:.0f}%")
+    with col3:
+        st.metric("今日呼叫", usage["today_calls"], "次")
+
+    # 預算進度條（NT$ 顯示）
+    bar_color = '#ef4444' if month_pct > 80 else '#f59e0b' if month_pct > 50 else '#10b981'
+    st.markdown(f"""
+    <div style="margin: 14px 0;">
+        <div style="display:flex; justify-content:space-between; margin-bottom:4px; font-size:13px;">
+            <span>本月預算 NT${monthly_limit_twd:.0f}</span>
+            <span>{month_pct:.0f}%</span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-fill" style="width:{month_pct}%; background: {bar_color};">
+                NT${usage['month_twd']:.0f}
+            </div>
+        </div>
+        <div style="font-size:11px; color:#888; margin-top:3px;">
+            計費週期：{date.today().replace(day=1)} ~ 月底｜匯率：1 USD = NT${USD_TO_TWD}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if month_pct > 80:
+        st.warning("⚠️ 本月預算即將用完，請節省使用或請家長調整 Secrets 中的 MONTHLY_BUDGET_USD")
+
+    st.divider()
+
+    with get_db() as conn:
+        engine_stats = conn.execute("""
+            SELECT engine, COUNT(*) as calls, SUM(estimated_cost_usd) as cost,
+                   SUM(input_tokens) as in_tk, SUM(output_tokens) as out_tk
+            FROM api_usage
+            WHERE date >= date('now', 'start of month')
+            GROUP BY engine
+        """).fetchall()
+
+    if engine_stats:
+        st.subheader("📊 本月各引擎使用統計")
+        for s in engine_stats:
+            cost_twd = (s['cost'] or 0) * USD_TO_TWD
+            with st.expander(f"{s['engine']} — NT${cost_twd:.0f}（{s['calls']} 次）"):
+                st.write(f"- 輸入 token：{s['in_tk']:,}")
+                st.write(f"- 輸出 token：{s['out_tk']:,}")
+                st.write(f"- 費用：NT${cost_twd:.1f} (≈ ${s['cost']:.4f} USD)")
+
+
+# ---------- 💾 資料備份 ----------
+elif page == "💾 資料備份":
+    st.header("💾 資料備份")
+    st.warning("⚠️ Streamlit Cloud 重啟可能會清空資料，建議**每週下載備份一次**。")
+
+    backup_data = export_db_json()
+    st.download_button(
+        "⬇️ 下載完整備份（JSON）",
+        backup_data,
+        file_name=f"study_backup_{date.today()}.json",
+        mime="application/json",
+        type="primary",
+    )
+
+    with get_db() as conn:
+        wrong_cnt = conn.execute("SELECT COUNT(*) FROM wrong_book").fetchone()[0]
+        score_cnt = conn.execute("SELECT COUNT(*) FROM score_log").fetchone()[0]
+        log_cnt = conn.execute("SELECT COUNT(*) FROM daily_log").fetchone()[0]
+
+    st.markdown(f"""
+    ### 📊 目前資料量
+    - 錯題本：**{wrong_cnt}** 題
+    - 分數紀錄：**{score_cnt}** 筆
+    - 每日紀錄：**{log_cnt}** 筆
+    """)
+
+    st.divider()
+    st.markdown("""
+    ### 📱 把這個 App 加到 iPad 主畫面
+    1. 在 iPad 用 **Safari** 打開這個網址
+    2. 點底部的 **分享** 按鈕（方框 + 向上箭頭）
+    3. 選 **「加入主畫面」**
+    """)
+
+
+# ---------- 🔐 家長後台 ----------
+elif page == "🔐 家長後台":
+    st.header("🔐 家長後台")
+    
+    if not check_parent_password():
+        st.stop()
+    
+    st.success("✅ 已登入家長後台")
+    
+    if st.button("🚪 登出家長後台"):
+        st.session_state.parent_authenticated = False
+        st.rerun()
+    
+    st.divider()
+    
+    # 模組開關
+    st.subheader("🎮 功能模組開關")
+    
+    reward_on = st.toggle(
+        "🏆 達標獎勵系統",
+        value=get_reward_enabled(),
+        help="開啟後，Queenie 會在「今日任務」和「進度追蹤」看到達標進度。獎勵內容由您決定，App 不顯示具體獎品。",
+    )
+    if reward_on != get_reward_enabled():
+        set_setting("reward_enabled", "1" if reward_on else "0")
+        st.rerun()
+    
+    if reward_on:
+        st.info("✅ 獎勵系統已啟用")
+    else:
+        st.caption("💡 建議：使用 App 持續 2-3 週後再啟動獎勵系統，效果更好")
+    
+    st.divider()
+    
+    # 達標標準設定
+    if reward_on:
+        st.subheader("🎯 達標標準設定")
+        
+        with st.form("reward_settings"):
+            month_q_target = st.number_input(
+                "每月題數目標",
+                min_value=100, max_value=2000, step=50,
+                value=int(get_setting("monthly_q_target", "600")),
+                help="每月完成多少題視為達標"
+            )
+            
+            st.markdown("**🎯 條件 2：學校成績進步（您手動標記）**")
+            school_improved = st.checkbox(
+                "本月學校成績有 1+ 科進步 5 分以上",
+                value=get_setting("month_school_improved", "0") == "1",
+            )
+            
+            st.markdown("**🎯 條件 4：心態評估（您主觀評估）**")
+            attitude_ok = st.checkbox(
+                "本月 Queenie 心態狀態良好",
+                value=get_setting("month_attitude_ok", "0") == "1",
+            )
+            
+            if st.form_submit_button("💾 儲存設定", type="primary"):
+                set_setting("monthly_q_target", str(month_q_target))
+                set_setting("month_school_improved", "1" if school_improved else "0")
+                set_setting("month_attitude_ok", "1" if attitude_ok else "0")
+                st.success("✅ 已儲存")
+                st.rerun()
+        
+        st.divider()
+        
+        # 當前狀態
+        st.subheader("📊 當前達標狀態")
+        ach = get_achievement_status()
+        for cond in ach["conditions"]:
+            icon = "✅" if cond["achieved"] else "⏳"
+            st.markdown(f"{icon} **{cond['name']}** — {cond['detail']}")
+        
+        st.markdown(f"### 進度：{ach['achieved_count']} / 4")
+        if ach["is_great"]:
+            st.success("🌟 Queenie 本月滿分達標！可以準備驚喜獎勵 ❤️")
+        elif ach["is_good"]:
+            st.info("⭐ Queenie 本月達成標準！可以給予肯定")
+    
+    st.divider()
+    
+    # 家長觀察筆記
+    st.subheader("📝 家長觀察筆記")
+    notes = st.text_area(
+        "私下記錄（Queenie 看不到）",
+        value=get_setting("parent_notes", ""),
+        height=120,
+        placeholder="記錄 Queenie 的觀察、與爸爸的討論、給 AI 的指示..."
+    )
+    if st.button("💾 儲存筆記"):
+        set_setting("parent_notes", notes)
+        st.success("✅ 筆記已儲存")
+    
+    st.divider()
+    
+    # 重要提醒
+    with st.expander("📖 家長使用指南"):
+        st.markdown("""
+        ### 🎯 漸進式啟動策略（建議）
+        
+        **第 1-2 週**：獎勵系統「關閉」
+        - 讓 Queenie 自然培養使用習慣
+        - 您私下觀察她的接受度
+        
+        **第 3 週**：評估
+        - 她使用頻率夠高嗎？
+        - 學校成績有變化嗎？
+        - 跟爸爸討論獎勵內容
+        
+        **第 4 週起**：啟動獎勵系統
+        - 找輕鬆時刻告訴 Queenie：「媽媽看你最近用 App 很認真，多了個達標功能」
+        - 不要事先承諾具體獎勵內容（保留驚喜）
+        
+        ### 💝 月底家庭會議模板
+        
+        1. **先稱讚**：「化學進步好多！」
+        2. **問感覺**：「用 App 順手嗎？」
+        3. **給驚喜**：「媽媽決定給你 X 獎勵」
+        4. **問目標**：「下個月想突破哪科？」
+        
+        ### 🛡️ 鐵則
+        
+        - ❌ 不要說「達標就給 NT$3000」（變成交易）
+        - ✅ 要說「我看到你的努力，準備了驚喜」（變成肯定）
+        """)
+
+
+# 頁尾
+st.divider()
+st.caption(f"🎓 v3.6 | 引擎：{engine} | 教材：{publisher}版 {grade}{subject} | 距學測 {phase_info['days_left']} 天")
