@@ -626,41 +626,34 @@ with st.sidebar:
         total_count = len(all_options)
         photo_count_hint = f"📸 收藏了 {total_count} 個影像" if total_count > 1 else ""
 
+        # 注意：HTML 內容必須緊靠左側無縮排，否則 Streamlit 會誤判為程式碼區塊
         if media_type == "video":
-            media_html = f'''
-            <video autoplay loop muted playsinline
-                   style="width:120px; height:120px; object-fit:cover; border-radius:50%; border:3px solid #ff6b35; box-shadow:0 4px 12px rgba(0,0,0,0.15);">
-                <source src="data:{media_mime};base64,{photo_b64}" type="{media_mime}">
-            </video>
-            '''
+            media_html = f'<video autoplay loop muted playsinline style="width:120px; height:120px; object-fit:cover; border-radius:50%; border:3px solid #ff6b35; box-shadow:0 4px 12px rgba(0,0,0,0.15);"><source src="data:{media_mime};base64,{photo_b64}" type="{media_mime}"></video>'
         else:
-            media_html = f'''
-            <img src="data:{media_mime};base64,{photo_b64}"
-                 style="width:120px; height:120px; object-fit:cover; border-radius:50%; border:3px solid #ff6b35; box-shadow:0 4px 12px rgba(0,0,0,0.15);">
-            '''
+            media_html = f'<img src="data:{media_mime};base64,{photo_b64}" style="width:120px; height:120px; object-fit:cover; border-radius:50%; border:3px solid #ff6b35; box-shadow:0 4px 12px rgba(0,0,0,0.15);">'
 
-        st.markdown(f"""
-        <div style="text-align:center; padding:10px; background:linear-gradient(135deg,#fff3e0,#ffe0b2); border-radius:12px; margin-bottom:12px;">
-            {media_html}
-            <div style="margin-top:8px; font-weight:bold; color:#d84315;">
-                {cat_mood} {cat_name}
-            </div>
-            <div style="font-size:13px; color:#5d4037; margin-top:4px; padding:0 8px;">
-                "{cat_says}"
-            </div>
-            {f'<div style="margin-top:6px; font-size:12px; color:#ff6b35; font-weight:bold;">🔥 連續達標 {streak} 天！</div>' if streak > 0 else ''}
-            {f'<div style="margin-top:4px; font-size:11px; color:#8d6e63;">{photo_count_hint}</div>' if photo_count_hint else ''}
-        </div>
-        """, unsafe_allow_html=True)
+        streak_html = f'<div style="margin-top:6px; font-size:12px; color:#ff6b35; font-weight:bold;">🔥 連續達標 {streak} 天！</div>' if streak > 0 else ''
+        count_html = f'<div style="margin-top:4px; font-size:11px; color:#8d6e63;">{photo_count_hint}</div>' if photo_count_hint else ''
+
+        sidebar_html = (
+            f'<div style="text-align:center; padding:10px; background:linear-gradient(135deg,#fff3e0,#ffe0b2); border-radius:12px; margin-bottom:12px;">'
+            f'{media_html}'
+            f'<div style="margin-top:8px; font-weight:bold; color:#d84315;">{cat_mood} {cat_name}</div>'
+            f'<div style="font-size:13px; color:#5d4037; margin-top:4px; padding:0 8px;">"{cat_says}"</div>'
+            f'{streak_html}'
+            f'{count_html}'
+            f'</div>'
+        )
+        st.markdown(sidebar_html, unsafe_allow_html=True)
     else:
-        st.markdown("""
-        <div style="text-align:center; padding:20px; background:#fff3e0; border-radius:12px; margin-bottom:12px;">
-            <div style="font-size:40px;">🐱</div>
-            <div style="font-size:13px; color:#5d4037; margin-top:8px;">
-                到「🐱 我的貓咪」上傳照片！
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            '<div style="text-align:center; padding:20px; background:#fff3e0; border-radius:12px; margin-bottom:12px;">'
+            '<div style="font-size:40px;">🐱</div>'
+            '<div style="font-size:13px; color:#5d4037; margin-top:8px;">'
+            '到「🐱 我的貓咪」上傳照片！'
+            '</div></div>',
+            unsafe_allow_html=True
+        )
 
     st.title(f"🎓 {NICKNAME} 學測導航")
 
